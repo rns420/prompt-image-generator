@@ -39,9 +39,16 @@ export const Route = createFileRoute("/api/public/generate-image")({
 
         if (!upstream.ok) {
           const text = await upstream.text().catch(() => "");
+          const retryAfter = upstream.headers.get("retry-after");
           return Response.json(
-            { error: text || `Image generation failed (${upstream.status})` },
-            { status: upstream.status },
+            {
+              error: text || `Image generation failed (${upstream.status})`,
+              retryAfter: retryAfter ? Number(retryAfter) : undefined,
+            },
+            {
+              status: upstream.status,
+              headers: retryAfter ? { "retry-after": retryAfter } : undefined,
+            },
           );
         }
 

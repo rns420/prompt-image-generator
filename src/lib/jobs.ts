@@ -23,7 +23,9 @@ export type JobItem = {
 };
 
 const BUCKET = "generations";
-const CONCURRENCY = 8;
+const MAX_CONCURRENCY = 6;
+const MIN_CONCURRENCY = 1;
+const MAX_ATTEMPTS = 8;
 
 export async function createJob(title: string, prompts: ParsedPrompt[]): Promise<Job> {
   const { data: job, error } = await supabase
@@ -72,25 +74,100 @@ export async function listJobItems(jobId: string): Promise<JobItem[]> {
   return all;
 }
 
-async function generateOne(item: JobItem, jobId: string) {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+class RetryableError extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+  }
+}
+
+/** Shared throttle: all workers respect one pause window and one active limit. */
+class Throttle {
+  limit = MAX_CONCURRENCY;
+  private pauseUntil = 0;
+  private successStreak = 0;
+
+  async gate() {
+    for (;;) {
+      const wait = this.pauseUntil - Date.now();
+      if (wait <= 0) return;
+      await sleep(Math.min(wait, 1000));
+    }
+  }
+
+  onRateLimit(retryAfterMs?: number) {
+    this.successStreak = 0;
+    this.limit = Math.max(MIN_CONCURRENCY, Math.floor(this.limit / 2));
+    const cool = retryAfterMs ?? 5000;
+    this.pauseUntil = Math.max(this.pauseUntil, Date.now() + cool);
+  }
+
+  onSuccess() {
+    this.successStreak++;
+    if (this.successStreak >= 15 && this.limit < MAX_CONCURRENCY) {
+      this.limit++;
+      this.successStreak = 0;
+    }
+  }
+}
+
+async function requestImage(prompt: string): Promise<string> {
   const res = await fetch("/api/public/generate-image", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt: item.prompt }),
+    body: JSON.stringify({ prompt }),
   });
   if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error ?? `Generation failed (${res.status})`);
+    const body = (await res.json().catch(() => ({}))) as { error?: string; retryAfter?: number };
+    const header = res.headers.get("retry-after");
+    const retryAfterMs = body.retryAfter
+      ? body.retryAfter * 1000
+      : header
+        ? Number(header) * 1000
+        : undefined;
+    const msg = (body.error ?? `Generation failed (${res.status})`).slice(0, 300);
+    if (res.status === 429 || res.status >= 500) {
+      throw new RetryableError(`${res.status}: ${msg}`, retryAfterMs);
+    }
+    throw new Error(`${res.status}: ${msg}`);
   }
   const { b64 } = (await res.json()) as { b64: string };
-  const bytes = base64ToBytes(b64);
-  const path = `${jobId}/${padNumber(item.number)}.png`;
-  const { error } = await supabase.storage.from(BUCKET).upload(path, bytes, {
-    contentType: "image/png",
-    upsert: true,
-  });
-  if (error) throw new Error(error.message);
-  return path;
+  if (!b64) throw new RetryableError("Empty image response");
+  return b64;
+}
+
+/** Generates one image with bounded auto-retry on 429/5xx/network errors. */
+async function generateOne(item: JobItem, jobId: string, throttle: Throttle) {
+  let lastError = "Generation failed";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    await throttle.gate();
+    try {
+      const b64 = await requestImage(item.prompt);
+      const bytes = base64ToBytes(b64);
+      const path = `${jobId}/${padNumber(item.number)}.png`;
+      const { error } = await supabase.storage.from(BUCKET).upload(path, bytes, {
+        contentType: "image/png",
+        upsert: true,
+      });
+      if (error) throw new RetryableError(error.message);
+      throttle.onSuccess();
+      return path;
+    } catch (e) {
+      const err = e as Error;
+      lastError = err.message;
+      const retryable = err instanceof RetryableError || err.name === "TypeError";
+      if (!retryable || attempt === MAX_ATTEMPTS) throw new Error(lastError);
+      const retryAfterMs = err instanceof RetryableError ? err.retryAfterMs : undefined;
+      if (/^429/.test(lastError) || retryAfterMs) throttle.onRateLimit(retryAfterMs);
+      const backoff = Math.min(30000, 1500 * 2 ** (attempt - 1));
+      await sleep((retryAfterMs ?? backoff) + Math.random() * 750);
+    }
+  }
+  throw new Error(lastError);
 }
 
 export async function runJob(
@@ -98,16 +175,24 @@ export async function runJob(
   items: JobItem[],
   onProgress: (done: number, failed: number, last?: string) => void,
 ) {
-  const pending = items.filter((i) => i.status !== "done");
-  let done = items.length - pending.length;
+  const queue = items.filter((i) => i.status !== "done");
+  let done = items.length - queue.length;
   let failed = 0;
   let cursor = 0;
+  let active = 0;
+  const throttle = new Throttle();
 
   const worker = async () => {
-    while (cursor < pending.length) {
-      const item = pending[cursor++]!;
+    while (cursor < queue.length) {
+      // respect the adaptive concurrency limit
+      if (active >= throttle.limit) {
+        await sleep(250);
+        continue;
+      }
+      const item = queue[cursor++]!;
+      active++;
       try {
-        const path = await generateOne(item, job.id);
+        const path = await generateOne(item, job.id, throttle);
         await supabase
           .from("job_items")
           .update({ status: "done", storage_path: path, error: null })
@@ -121,6 +206,8 @@ export async function runJob(
           .update({ status: "failed", error: (e as Error).message.slice(0, 500) })
           .eq("id", item.id);
         onProgress(done, failed, `${padNumber(item.number)} failed`);
+      } finally {
+        active--;
       }
       if ((done + failed) % 10 === 0) {
         await supabase.from("jobs").update({ completed: done, failed }).eq("id", job.id);
@@ -128,7 +215,36 @@ export async function runJob(
     }
   };
 
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  await Promise.all(Array.from({ length: MAX_CONCURRENCY }, worker));
+
+  // Final sweep: one slow, sequential pass over anything still failed.
+  const stragglers = queue.filter((i) => !queue.some(() => false));
+  void stragglers;
+  const stillFailed = await listJobItems(job.id).then((all) =>
+    all.filter((i) => i.status !== "done"),
+  );
+  if (stillFailed.length) {
+    throttle.limit = 1;
+    for (const item of stillFailed) {
+      try {
+        const path = await generateOne(item, job.id, throttle);
+        await supabase
+          .from("job_items")
+          .update({ status: "done", storage_path: path, error: null })
+          .eq("id", item.id);
+        done++;
+        failed = Math.max(0, failed - 1);
+        onProgress(done, failed, `${padNumber(item.number)}.png`);
+      } catch {
+        /* keep as failed */
+      }
+      await sleep(400);
+    }
+  }
+
+  const finalItems = await listJobItems(job.id);
+  done = finalItems.filter((i) => i.status === "done").length;
+  failed = finalItems.length - done;
 
   await supabase
     .from("jobs")
