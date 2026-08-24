@@ -23,7 +23,9 @@ export type JobItem = {
 };
 
 const BUCKET = "generations";
-const CONCURRENCY = 8;
+const MAX_CONCURRENCY = 6;
+const MIN_CONCURRENCY = 1;
+const MAX_ATTEMPTS = 8;
 
 export async function createJob(title: string, prompts: ParsedPrompt[]): Promise<Job> {
   const { data: job, error } = await supabase
